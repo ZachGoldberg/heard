@@ -1,0 +1,13 @@
+[Unit]
+Description=Local real-time transcript of calls (heard): read-only capture, local Whisper, ~/.local/share/heard
+After=graphical-session.target pulseaudio.service
+
+[Service]
+ExecStart=%h/.local/bin/heard-daemon
+# Exits with 75 when the machine is about to sleep (releases the GPU); restart after resume.
+Restart=always
+RestartSec=10
+Nice=5
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""heard: search the local transcript written by heard-daemon.
+
+  heard budget               utterances matching "budget" (SQLite FTS syntax: "exact phrase", deploy OR release)
+  heard --last 3m            everything from the last 3 minutes (also 90s, 2h, 1d)
+  heard --last 10m budget    matches within the last 10 minutes
+  heard --follow             print new lines as they arrive, plus a live line of what's being said now
+  heard pause | resume       stop / restart capturing (status shows which)
+  heard status
+"""
+import argparse
+import json
+import os
+import re
+import shutil
+import sqlite3
+import sys
+import time
+from pathlib import Path
+
+DATA_DIRECTORY = Path.home() / ".local/share/heard"
+DATABASE_PATH = DATA_DIRECTORY / "heard.db"
+PAUSE_FLAG = DATA_DIRECTORY / "paused"
+LIVE_PATH = DATA_DIRECTORY / "live.json"
+LIVE_MAX_AGE_SECONDS = 6
+UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+def parse_duration(text):
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)([smhd]?)", text)
+    if not match:
+        raise argparse.ArgumentTypeError(f"not a duration: {text} (try 3m, 90s, 2h)")
+    return float(match.group(1)) * UNIT_SECONDS[match.group(2) or "m"]
+
+
+def show(row):
+    text, speaker, started_at = row
+    stamp = time.strftime("%a %H:%M:%S", time.localtime(float(started_at)))
+    print(f"{stamp}  {speaker:>4}: {text}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("words", nargs="*", help="search terms, or pause / resume / status")
+    parser.add_argument("--last", type=parse_duration, help="only this far back, e.g. 3m")
+    parser.add_argument("--follow", "-f", action="store_true", help="keep printing new utterances")
+    parser.add_argument("--limit", type=int, default=200)
+    arguments = parser.parse_args()
+
+    if arguments.words in (["pause"], ["resume"], ["status"]):
+        command = arguments.words[0]
+        DATA_DIRECTORY.mkdir(parents=True, exist_ok=True)
+        if command == "pause":
+            PAUSE_FLAG.touch()
+        elif command == "resume":
+            PAUSE_FLAG.unlink(missing_ok=True)
+        print("heard is", "PAUSED" if PAUSE_FLAG.exists() else "capturing (if heard.service is running)")
+        return 0
+
+    if not DATABASE_PATH.exists():
+        print("No transcript yet: heard.service has not written anything.", file=sys.stderr)
+        return 1
+    connection = sqlite3.connect(f"file:{DATABASE_PATH}?mode=ro", uri=True)
+    since = time.time() - arguments.last if arguments.last else 0
+    query = " ".join(arguments.words)
+    if query:
+        sql = ("SELECT text, speaker, started_at FROM utterances WHERE utterances MATCH ? "
+               "AND CAST(started_at AS REAL) >= ? ORDER BY CAST(started_at AS REAL) DESC LIMIT ?")
+        rows = connection.execute(sql, (query, since, arguments.limit)).fetchall()[::-1]
+    else:
+        if not arguments.last and not arguments.follow:
+            since = time.time() - 600
+        sql = ("SELECT text, speaker, started_at FROM utterances WHERE CAST(started_at AS REAL) >= ? "
+               "ORDER BY CAST(started_at AS REAL) DESC LIMIT ?")
+        rows = connection.execute(sql, (since, arguments.limit)).fetchall()[::-1]
+    for row in rows:
+        show(row)
+
+    if arguments.follow:
+        follow(connection, float(rows[-1][2]) if rows else time.time())
+    return 0
+
+
+def live_line(newest):
+    """What is being said right now (partial text), newer than the last finished line."""
+    try:
+        live = json.loads(LIVE_PATH.read_text())
+    except (OSError, ValueError):
+        return ""
+    parts = [f"{speaker}: {entry['text']}" for speaker, entry in sorted(live.items())
+             if time.time() - entry["updated_at"] < LIVE_MAX_AGE_SECONDS and entry["started_at"] > newest - 1]
+    return "  …  ".join(parts)
+
+
+def follow(connection, newest):
+    interactive = sys.stdout.isatty()
+    shown_live = ""
+    while True:
+        time.sleep(0.25)
+        fresh = connection.execute(
+            "SELECT text, speaker, started_at FROM utterances WHERE CAST(started_at AS REAL) > ? "
+            "ORDER BY CAST(started_at AS REAL)", (newest,)).fetchall()
+        current_live = live_line(newest) if interactive else ""
+        if not fresh and current_live == shown_live:
+            continue
+        if interactive:
+            sys.stdout.write("\r\033[K")
+        for row in fresh:
+            show(row)
+            newest = float(row[2])
+        if interactive:
+            current_live = live_line(newest)
+            width = shutil.get_terminal_size().columns
+            if current_live:
+                sys.stdout.write("\033[2m… " + current_live[-(width - 3):] + "\033[0m")
+            sys.stdout.flush()
+        shown_live = current_live
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(0)

@@ -1,0 +1,266 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#   "faster-whisper>=1.1",
+#   "numpy",
+#   "nvidia-cublas-cu12",
+#   "nvidia-cudnn-cu12>=9,<10",
+# ]
+# ///
+"""heard-daemon: local, real-time transcript of what you say and what you hear.
+
+Two read-only PulseAudio capture streams (parec) feed a local Whisper model on the GPU:
+  - "them": the monitor of the current default output, re-resolved every few seconds so it follows you
+    when you switch between speakers and headphones (whatever you hear: Zoom, Slack, Meet, …)
+  - "me":   the default microphone
+Capturing a monitor or a microphone never changes routing; this never loads modules or moves streams.
+
+Utterances go into ~/.local/share/heard/heard.db (SQLite FTS5); `heard` searches them.
+Nothing leaves the machine. `heard pause` / `heard resume` toggle capture; rows older than
+HEARD_RETENTION_DAYS (default 7) are deleted hourly.
+
+Environment overrides: HEARD_THEM_SOURCE, HEARD_ME_SOURCE, HEARD_MODEL, HEARD_RETENTION_DAYS.
+"""
+import ctypes
+import glob
+import json
+import os
+import queue
+import signal
+import sqlite3
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+import numpy
+
+SAMPLE_RATE = 16000
+FRAME_SECONDS = 0.03
+FRAME_SAMPLES = int(SAMPLE_RATE * FRAME_SECONDS)
+SILENCE_TO_CLOSE_SECONDS = 0.5      # a pause this long ends an utterance
+MAX_UTTERANCE_SECONDS = 10.0        # long monologues are cut so final text shows up promptly
+PARTIAL_INTERVAL_SECONDS = 1.0      # while someone talks, re-transcribe the utterance so far this often
+MIN_SPEECH_SECONDS = 0.4            # ignore clicks and coughs
+CLEANUP_INTERVAL_SECONDS = 3600
+EXIT_FOR_SLEEP = 75   # heard.service restarts on this code; the restart lands after resume
+
+DATA_DIRECTORY = Path.home() / ".local/share/heard"
+DATABASE_PATH = DATA_DIRECTORY / "heard.db"
+PAUSE_FLAG = DATA_DIRECTORY / "paused"
+LIVE_PATH = DATA_DIRECTORY / "live.json"   # in-progress (partial) text per speaker, for `heard -f`
+
+THEM_SOURCE = os.environ.get("HEARD_THEM_SOURCE", "")   # empty: follow the current default output
+SOURCE_CHECK_SECONDS = 2.0
+ME_SOURCE = os.environ.get("HEARD_ME_SOURCE", "@DEFAULT_SOURCE@")
+MODEL_NAME = os.environ.get("HEARD_MODEL", "large-v3-turbo")
+CPU_MODEL_NAME = os.environ.get("HEARD_CPU_MODEL", "small.en")   # used when the GPU is unusable
+CPU_THREADS = int(os.environ.get("HEARD_CPU_THREADS", "6"))      # half the cores, so calls stay smooth
+RETENTION_DAYS = float(os.environ.get("HEARD_RETENTION_DAYS", "7"))
+
+stopping = threading.Event()
+latest_partials = {}                 # speaker -> (started_at, audio so far); newest wins
+partials_lock = threading.Lock()
+
+
+def log(message):
+    print(time.strftime("%H:%M:%S"), message, flush=True)
+
+
+def preload_cuda_libraries():
+    """faster-whisper (CTranslate2) dlopens cuBLAS/cuDNN; load the pip-installed copies first."""
+    import nvidia.cublas.lib
+    import nvidia.cudnn.lib
+    for library_directory in (nvidia.cublas.lib.__path__[0], nvidia.cudnn.lib.__path__[0]):
+        for library in sorted(glob.glob(os.path.join(library_directory, "lib*.so*"))):
+            try:
+                ctypes.CDLL(library, mode=ctypes.RTLD_GLOBAL)
+            except OSError:
+                pass
+
+
+def open_database():
+    DATA_DIRECTORY.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS utterances USING fts5("
+        "text, speaker UNINDEXED, started_at UNINDEXED, ended_at UNINDEXED)")
+    os.chmod(DATABASE_PATH, 0o600)
+    return connection
+
+
+def default_output_monitor():
+    """The monitor of whatever output is the default right now (speakers, headphones, …)."""
+    result = subprocess.run(["pactl", "get-default-sink"], capture_output=True, text=True)
+    return result.stdout.strip() + ".monitor"
+
+
+def capture(speaker, resolve_source, chunks):
+    """Read one source forever, cut it into utterances with a simple energy gate, queue them.
+
+    resolve_source() is re-checked every few seconds; when it changes (the default output was
+    switched), the capture restarts on the new source straight away."""
+    while not stopping.is_set():
+        source = resolve_source()
+        last_check = time.time()
+        switched = False
+        command = ["parec", f"--device={source}", "--raw", "--format=s16le", f"--rate={SAMPLE_RATE}",
+                   "--channels=1", "--latency-msec=100", f"--client-name=heard ({speaker})"]
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        log(f"capturing {speaker} from {source}")
+        noise_floor = 200.0
+        utterance_frames = []
+        speech_frames = 0
+        silent_run = 0
+        started_at = None
+        last_partial = 0.0
+        while not stopping.is_set():
+            raw = process.stdout.read(FRAME_SAMPLES * 2)
+            if not raw or len(raw) < FRAME_SAMPLES * 2:
+                break
+            if PAUSE_FLAG.exists():
+                utterance_frames, speech_frames, silent_run, started_at = [], 0, 0, None
+                continue
+            if time.time() - last_check >= SOURCE_CHECK_SECONDS:
+                last_check = time.time()
+                if resolve_source() != source:
+                    switched = True
+                    break
+            frame = numpy.frombuffer(raw, dtype=numpy.int16)
+            loudness = float(numpy.sqrt(numpy.mean(frame.astype(numpy.float32) ** 2)))
+            is_speech = loudness > max(noise_floor * 3.0, 300.0)
+            if not is_speech:
+                noise_floor = 0.95 * noise_floor + 0.05 * loudness
+            if is_speech or utterance_frames:
+                if started_at is None:
+                    started_at = time.time()
+                utterance_frames.append(frame)
+                speech_frames += is_speech
+                silent_run = 0 if is_speech else silent_run + 1
+            duration = len(utterance_frames) * FRAME_SECONDS
+            if (utterance_frames and duration >= PARTIAL_INTERVAL_SECONDS and speech_frames
+                    and time.time() - last_partial >= PARTIAL_INTERVAL_SECONDS):
+                last_partial = time.time()
+                with partials_lock:
+                    latest_partials[speaker] = (started_at, numpy.concatenate(utterance_frames).astype(numpy.float32) / 32768.0)
+            if utterance_frames and (silent_run * FRAME_SECONDS >= SILENCE_TO_CLOSE_SECONDS
+                                     or duration >= MAX_UTTERANCE_SECONDS):
+                if speech_frames * FRAME_SECONDS >= MIN_SPEECH_SECONDS:
+                    audio = numpy.concatenate(utterance_frames).astype(numpy.float32) / 32768.0
+                    chunks.put((speaker, started_at, time.time(), audio))
+                with partials_lock:
+                    latest_partials.pop(speaker, None)
+                utterance_frames, speech_frames, silent_run, started_at = [], 0, 0, None
+        process.terminate()
+        if switched:
+            log(f"{speaker}: output changed, following it")
+        elif not stopping.is_set():
+            log(f"{speaker} capture from {source} ended; retrying in 5 s")
+            time.sleep(5)
+
+
+def load_model():
+    """The big model on the GPU; if CUDA is broken (e.g. the driver wants a reboot after a
+    suspend/resume fault), a small English model on the CPU so transcripts keep coming."""
+    from faster_whisper import WhisperModel
+    try:
+        preload_cuda_libraries()
+        model = WhisperModel(MODEL_NAME, device="cuda", compute_type="float16")
+        log(f"model {MODEL_NAME} loaded on the GPU")
+    except Exception as error:
+        log(f"GPU unavailable ({error}); using {CPU_MODEL_NAME} on the CPU")
+        model = WhisperModel(CPU_MODEL_NAME, device="cpu", compute_type="int8", cpu_threads=CPU_THREADS)
+        log(f"model {CPU_MODEL_NAME} loaded on the CPU")
+    return model
+
+
+def write_live(live):
+    temporary = LIVE_PATH.with_suffix(".tmp")
+    temporary.write_text(json.dumps(live))
+    os.replace(temporary, LIVE_PATH)
+
+
+def transcribe(chunks, connection):
+    """Finished utterances first (they go into the database); when none are waiting, refresh
+    the live partial text of whoever is still talking (live.json, shown by `heard -f`)."""
+    model = load_model()
+    live = {}
+    write_live(live)
+    while not stopping.is_set():
+        try:
+            speaker, started_at, ended_at, audio = chunks.get(timeout=0.1)
+        except queue.Empty:
+            with partials_lock:
+                speaker = next(iter(latest_partials), None)
+                partial = latest_partials.pop(speaker, None) if speaker else None
+            if partial:
+                started_at, audio = partial
+                segments, _ = model.transcribe(audio, language="en", beam_size=1, vad_filter=False,
+                                               condition_on_previous_text=False, without_timestamps=True)
+                partial_text = " ".join(segment.text.strip() for segment in segments).strip()
+                if partial_text:
+                    live[speaker] = {"text": partial_text, "started_at": started_at, "updated_at": time.time()}
+                    write_live(live)
+            continue
+        segments, _ = model.transcribe(audio, language="en", beam_size=1, vad_filter=True,
+                                       condition_on_previous_text=False)
+        text = " ".join(segment.text.strip() for segment in segments).strip()
+        if text:
+            connection.execute("INSERT INTO utterances (text, speaker, started_at, ended_at) VALUES (?, ?, ?, ?)",
+                               (text, speaker, started_at, ended_at))
+            connection.commit()
+        if live.pop(speaker, None) is not None:
+            write_live(live)
+
+
+def clean_up(connection):
+    while not stopping.wait(CLEANUP_INTERVAL_SECONDS):
+        cutoff = time.time() - RETENTION_DAYS * 86400
+        connection.execute("DELETE FROM utterances WHERE CAST(started_at AS REAL) < ?", (cutoff,))
+        connection.commit()
+
+
+def exit_before_sleep():
+    """A CUDA context kept across suspend/resume faulted the GPU (NVIDIA Xid 31 → "reboot required").
+    So hold a logind delay lock, and when sleep is announced, exit: the lock is released with the
+    process, the machine sleeps, and systemd starts a fresh process (fresh CUDA context) after resume."""
+    inhibitor = subprocess.Popen(
+        ["systemd-inhibit", "--what=sleep", "--mode=delay", "--who=heard",
+         "--why=release the GPU before suspend", "sleep", "infinity"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    monitor = subprocess.Popen(
+        ["gdbus", "monitor", "--system", "--dest", "org.freedesktop.login1",
+         "--object-path", "/org/freedesktop/login1"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    for line in monitor.stdout:
+        if "PrepareForSleep" in line and "true" in line:
+            log("system is going to sleep: exiting to release the GPU")
+            stopping.set()
+            inhibitor.terminate()
+            os._exit(EXIT_FOR_SLEEP)
+
+
+def main():
+    connection = open_database()
+    chunks = queue.Queue(maxsize=200)
+    signal.signal(signal.SIGTERM, lambda *_: stopping.set())
+    workers = [
+        threading.Thread(target=capture, args=("them", (lambda: THEM_SOURCE) if THEM_SOURCE else default_output_monitor, chunks), daemon=True),
+        threading.Thread(target=capture, args=("me", lambda: ME_SOURCE, chunks), daemon=True),
+        threading.Thread(target=clean_up, args=(connection,), daemon=True),
+        threading.Thread(target=exit_before_sleep, daemon=True),
+    ]
+    for worker in workers:
+        worker.start()
+    try:
+        transcribe(chunks, connection)
+    except KeyboardInterrupt:
+        stopping.set()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
